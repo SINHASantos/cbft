@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/blevesearch/bleve/v2"
@@ -52,6 +53,13 @@ const (
 	defaultNumSamplesPerCentroid = minSamplesPerCentroid
 
 	trainerWaitOnKV = 10 * time.Second
+
+	// sampleChannelBuffer decouples the KV scanner goroutines from the
+	// BuildDocumentEx workers so neither side stalls on the other.
+	sampleChannelBuffer = 256
+	// sampleBuildWorkers is the number of goroutines that run BuildDocumentEx
+	// in parallel inside trainOnSamples.
+	sampleBuildWorkers = 4
 )
 
 type vectorIndexTrainer struct {
@@ -64,6 +72,8 @@ type vectorIndexTrainer struct {
 	mgr       *cbgt.Manager
 	worker    *samplingWorker
 	bleveDest *BleveDest
+
+	trainStats TrainingStats
 
 	doneCh  chan struct{}
 	closeCh chan struct{}
@@ -113,6 +123,10 @@ func initTrainer(bleveDest *BleveDest, kvconfig map[string]interface{}) trainer 
 	return nil
 }
 
+func (t *vectorIndexTrainer) WriteJSON(w io.Writer) {
+	t.trainStats.WriteJSON(w)
+}
+
 func (t *vectorIndexTrainer) wait() <-chan struct{} {
 	return t.doneCh
 }
@@ -156,7 +170,7 @@ func (r *samplingWorkerRegistry) getOrCreateWorker(indexName string) (*samplingW
 	if !ok {
 		worker = &samplingWorker{
 			ref:      1,
-			sampleCh: make(chan *sample, 1),
+			sampleCh: make(chan *sample, sampleChannelBuffer),
 			doneCh:   make(chan struct{}),
 			closeCh:  make(chan struct{}),
 			copyCh:   make(chan struct{}),
@@ -191,9 +205,10 @@ type sample struct {
 
 // samplingWorkerRunConfig holds the inputs for configuring a samplingWorker obj.
 type samplingWorkerRunConfig struct {
-	params   *samplingParams
-	vecIndex bleve.TrainableIndex
-	cluster  kvCluster
+	params     *samplingParams
+	vecIndex   bleve.TrainableIndex
+	cluster    kvCluster
+	trainStats *TrainingStats
 }
 
 type samplingParams struct {
@@ -287,6 +302,7 @@ func (w *samplingWorker) configure(c *samplingWorkerRunConfig) {
 	w.vecIndex = c.vecIndex
 	w.params = c.params
 	w.cluster = c.cluster
+	w.trainStats = c.trainStats
 }
 
 // run performs the sampling run: opens a sampling scan per collection, reads
@@ -321,19 +337,29 @@ func (w *samplingWorker) run() {
 				default:
 				}
 
+				fetchStart := time.Now()
 				doc, err := iterators[i].Next()
 				if err != nil {
 					errs[i] = err
 					return
 				}
+				atomic.AddUint64(&w.trainStats.TotKVFetchTimeInNs, uint64(time.Since(fetchStart)))
+
 				if doc == nil {
 					// iterator exhausted before reaching sampleLimit
 					continue
 				}
-				w.sampleCh <- &sample{
+
+				select {
+				case w.sampleCh <- &sample{
 					cid:   i,
 					id:    doc.ID,
 					value: doc.Val,
+				}:
+				case <-w.closeCh:
+					log.Warnf("trainer_vector: stopped sampling for collection %s "+
+						"due to close signal", w.params.collectionNames[i])
+					return
 				}
 			}
 		}(i)
@@ -501,12 +527,13 @@ func (t *vectorIndexTrainer) computeSampleLimitsForSources(agent *gocbcore.Agent
 
 // trainOnSamples consumes samples from ch, builds Bleve documents with
 // collection scope/UID in extras[sample.cid], indexes them into a training
-// batch, and calls vecIndex.Train(batch) when doneCh is closed. returns error
+// batch, and calls vecIndex.Train(batch) once all samples are consumed.
+// sampleBuildWorkers goroutines run BuildDocumentEx in parallel; a single
+// serializer goroutine calls batch.Index to avoid races on the batch.
 func (t *vectorIndexTrainer) trainOnSamples(ch chan *sample, defaultType string,
-	extras [][]byte, vecIndex bleve.TrainableIndex, doneCh chan struct{}) error {
+	extras [][]byte, vecIndex bleve.TrainableIndex) error {
 	batch := vecIndex.NewBatch()
 
-	// set the centroid count for the training process
 	trainingParams := &index.TrainingParams{
 		NumCentroids: t.numCentroids,
 	}
@@ -515,43 +542,88 @@ func (t *vectorIndexTrainer) trainOnSamples(ch chan *sample, defaultType string,
 		return err
 	}
 	batch.SetInternal([]byte(index.TrainingKey), bytes)
+	trainStart := time.Now()
 	err = vecIndex.Train(batch)
 	if err != nil {
 		return err
 	}
+	atomic.AddUint64(&t.trainStats.TotBatchTrainTimeInNs, uint64(time.Since(trainStart)))
 
-	for {
-		select {
-		case <-doneCh:
-			select {
-			case <-t.closeCh:
-				log.Warnf("trainer_vector: stopped training for %s due to close signal",
-					t.partitionName)
-				return fmt.Errorf("training stopped due to close signal")
-			default:
-			}
-
-			err := vecIndex.Train(batch)
-			if err != nil {
-				return err
-			}
-			return nil
-		case sample := <-ch:
-			if sample != nil {
-				doc, key, err := t.bleveDest.bleveDocConfig.BuildDocumentEx(
-					[]byte(sample.id), sample.value, defaultType,
-					cbgt.DEST_EXTRAS_TYPE_GOCBCORE_SCOPE_COLLECTION, nil, extras[sample.cid])
-				if err != nil {
-					return err
-				}
-
-				err = batch.Index(string(key), doc)
-				if err != nil {
-					return err
-				}
-			}
-		}
+	type builtDoc struct {
+		key string
+		doc *BleveDocument
 	}
+	docCh := make(chan builtDoc, sampleBuildWorkers*4)
+
+	var (
+		wg       sync.WaitGroup
+		buildErr error
+		errOnce  sync.Once
+	)
+
+	for i := 0; i < sampleBuildWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-t.closeCh:
+					return
+				case s, ok := <-ch:
+					if !ok || s == nil {
+						return
+					}
+					buildStart := time.Now()
+					doc, key, err := t.bleveDest.bleveDocConfig.BuildDocumentEx(
+						[]byte(s.id), s.value, defaultType,
+						cbgt.DEST_EXTRAS_TYPE_GOCBCORE_SCOPE_COLLECTION, nil, extras[s.cid])
+					if err != nil {
+						errOnce.Do(func() { buildErr = err })
+						return
+					}
+					atomic.AddUint64(&t.trainStats.TotDocBuildTimeInNs, uint64(time.Since(buildStart)))
+
+					select {
+					case docCh <- builtDoc{key: string(key), doc: doc}:
+					case <-t.closeCh:
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	// wait for all the documents to be indexed into the batch
+	go func() {
+		wg.Wait()
+		close(docCh)
+	}()
+
+	for bd := range docCh {
+		indexStart := time.Now()
+		err := batch.Index(bd.key, bd.doc)
+		if err != nil {
+			return err
+		}
+		atomic.AddUint64(&t.trainStats.TotBatchTrainTimeInNs, uint64(time.Since(indexStart)))
+	}
+
+	if buildErr != nil {
+		return buildErr
+	}
+
+	select {
+	case <-t.closeCh:
+		log.Warnf("trainer_vector: stopped training for %s due to close signal",
+			t.partitionName)
+		return fmt.Errorf("training stopped due to close signal")
+	default:
+	}
+
+	trainStart = time.Now()
+	err = vecIndex.Train(batch)
+	atomic.AddUint64(&t.trainStats.TotBatchTrainTimeInNs, uint64(time.Since(trainStart)))
+	return err
 }
 
 // trainedIndexConfig carries everything needed to create and train a trained index.
@@ -573,7 +645,9 @@ type trainedIndexConfig struct {
 // is closed so other BleveDests can copy the trained index.
 func (t *vectorIndexTrainer) createTrainedIndex(cfg *trainedIndexConfig) error {
 	var err error
+	samplingStart := time.Now()
 	defer func() {
+		atomic.AddUint64(&t.trainStats.TotTrainedIndexBuildTimeInNs, uint64(time.Since(samplingStart)))
 		cfg.worker.success = (err == nil)
 		close(cfg.worker.copyCh)
 	}()
@@ -654,7 +728,8 @@ func (t *vectorIndexTrainer) createTrainedIndex(cfg *trainedIndexConfig) error {
 				scopeName:       cfg.scopeName,
 				sourceName:      t.bleveDest.sourceName,
 			},
-			cluster: &gocbClusterAdapter{cluster: cluster},
+			cluster:    &gocbClusterAdapter{cluster: cluster},
+			trainStats: &t.trainStats,
 		})
 	}
 
@@ -662,7 +737,7 @@ func (t *vectorIndexTrainer) createTrainedIndex(cfg *trainedIndexConfig) error {
 
 	// single training thread
 	return t.trainOnSamples(cfg.worker.sampleCh, cfg.defaultType, extraOpts,
-		cfg.vecIndex, cfg.worker.doneCh)
+		cfg.vecIndex)
 }
 
 func (t *vectorIndexTrainer) markTrainingComplete(index bleve.TrainableIndex) error {
@@ -821,6 +896,7 @@ func (t *vectorIndexTrainer) acquireSamples() {
 		return
 	}
 
+	start := time.Now()
 	if ic, ok := worker.vecIndex.(bleve.IndexFileCopyable); ok && worker.success {
 		dest, ok := t.bleveDest.bindex.(bleve.IndexFileCopyable)
 		if !ok {
@@ -835,8 +911,8 @@ func (t *vectorIndexTrainer) acquireSamples() {
 		}
 		log.Printf("trainer_vector: finished copying trained index from"+
 			" source partition %s", worker.vecIndex.Name())
+		atomic.AddUint64(&t.trainStats.TotTrainedIndexCopyTimeInNs, uint64(time.Since(start)))
 	}
-
 }
 
 // trainedIndexWriter implements the writer used when copying the trained index

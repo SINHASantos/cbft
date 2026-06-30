@@ -423,6 +423,9 @@ type trainer interface {
 	wait() <-chan struct{}
 	// cleanup any resources
 	close() error
+
+	// a way to write out the training stats in JSON format
+	WriteJSON(w io.Writer)
 }
 
 func NewBleveDestEx(path string, bindex bleve.Index,
@@ -2426,6 +2429,8 @@ var prefixPIndexStoreStats = []byte(`{"pindexStoreStats":`)
 
 var prefixCopyPartitionStats = []byte(`,"copyPartitionStats":`)
 
+var prefixTrainingStats = []byte(`,"trainingStats":`)
+
 var prefixHerderStats = []byte(`,"herderStats":`)
 
 func writeHerderStatsJSON(w io.Writer) {
@@ -2587,6 +2592,13 @@ func (t *BleveDest) Stats(w io.Writer) (err error) {
 
 	t.copyStats.WriteJSON(w)
 
+	if t.trainingSampler != nil {
+		_, err = w.Write(prefixTrainingStats)
+		if err != nil {
+			return err
+		}
+		t.trainingSampler.WriteJSON(w)
+	}
 	_, err = w.Write(prefixHerderStats)
 	if err != nil {
 		return err

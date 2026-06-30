@@ -411,6 +411,7 @@ func newWorkerWithMockCluster(cluster kvCluster, collections []string, limits []
 			scopeName:       "testScope",
 			sourceName:      "testBucket",
 		},
+		trainStats: &TrainingStats{},
 	})
 	return w
 }
@@ -559,6 +560,7 @@ func TestSamplingWorkerRunStopsOnCloseCh(t *testing.T) {
 			collectionNames: []string{"col1"},
 			sampleLimit:     []int{100},
 		},
+		trainStats: &TrainingStats{},
 	})
 
 	go w.run()
@@ -648,7 +650,7 @@ func newTestWorkerAndConfig(t *testing.T, tr *vectorIndexTrainer, vecIndex bleve
 		scopeName:       params.scopeName,
 		collectionNames: params.collectionNames,
 		initClusterCallback: func() error {
-			worker.configure(&samplingWorkerRunConfig{cluster: cluster, params: params})
+			worker.configure(&samplingWorkerRunConfig{cluster: cluster, params: params, trainStats: &tr.trainStats})
 			return nil
 		},
 	}

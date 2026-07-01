@@ -18,6 +18,7 @@ import (
 	"reflect"
 	"sync"
 
+	"github.com/couchbase/cbauth"
 	"github.com/couchbase/cbft"
 	"github.com/couchbase/cbgt"
 	log "github.com/couchbase/clog"
@@ -265,6 +266,9 @@ func newTLSConfig(config *tls.Config) *tls.Config {
 				}
 				rv.ClientCAs = caCertPool
 				rv.ClientAuth = *ss.ClientAuthType
+				rv.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+					return cbauth.CRLsValidate(rawCerts, verifiedChains, cbauth.CRLScopeClientAuth)
+				}
 			} else {
 				rv.ClientAuth = tls.NoClientCert
 			}

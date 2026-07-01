@@ -194,16 +194,18 @@ func getGrpcOpts(hostPort string, certInBytes []byte, clientCert tls.Certificate
 		if !ok {
 			return nil, fmt.Errorf("grpc_util: failed to append ca certs")
 		}
+		tlsCfg := &tls.Config{
+			RootCAs: certPool,
+			VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+				return cbauth.CRLsValidate(rawCerts, verifiedChains, cbauth.CRLScopeNodeToNode)
+			},
+		}
 		var creds credentials.TransportCredentials
 		if shouldUseClientCert {
-			creds = credentials.NewTLS(&tls.Config{
-				RootCAs:      certPool,
-				Certificates: []tls.Certificate{clientCert},
-				ClientAuth:   clientAuth,
-			})
-		} else {
-			creds = credentials.NewClientTLSFromCert(certPool, "")
+			tlsCfg.Certificates = []tls.Certificate{clientCert}
+			tlsCfg.ClientAuth = clientAuth
 		}
+		creds = credentials.NewTLS(tlsCfg)
 		opts = append(opts, grpc.WithTransportCredentials(creds))
 	} else {
 		opts = append(opts, grpc.WithInsecure())

@@ -73,7 +73,7 @@ const (
 	// timeout for getting encryption keys from cbauth
 	getKeyTimeout = 2 * time.Minute
 	// timeout for key import by cbauth during rebalance
-	importKeyTimeout = int(2 * time.Minute)
+	importKeyTimeout = 2 * 60 * 1000 // 2 minutes in milliseconds
 	// number of parallel workers for drop keys operation
 	numParallelDrops = 4
 )

@@ -57,6 +57,11 @@ type encryptionManager struct {
 	// bucket store is responsible for managing bucket name to UUID mappings
 	// and caching the mappings for quick retrieval
 	bucketStore *bucketStore
+
+	// pindex source store caches pindex name to source (bucket) name
+	// mappings for non-scoped indexes, so the bleve writer hook does
+	// not have to consult the cfg on every file creation
+	pindexSourceStore *pindexSourceStore
 }
 
 // unique context used for deriving encryption keys for search service
@@ -88,9 +93,10 @@ func NewEncryptionManager(mgr *cbgt.Manager) (*encryptionManager, error) {
 
 	encryptionManagerOnce.Do(func() {
 		encryptionManagerInstance = &encryptionManager{
-			keyStore:    newKeyStore(mgr),
-			bucketStore: newBucketStore(mgr),
-			mgr:         mgr,
+			keyStore:          newKeyStore(mgr),
+			bucketStore:       newBucketStore(mgr),
+			pindexSourceStore: newPIndexSourceStore(mgr),
+			mgr:               mgr,
 		}
 	})
 
@@ -132,9 +138,12 @@ func NewEncryptionManager(mgr *cbgt.Manager) (*encryptionManager, error) {
 // ---------------------------- callbacks implementation --------------------------
 
 // updates bucket cache when there is an index introduction/deletion,
-// which is the only time we need to check bucket UUID changes
+// which is the only time we need to check bucket UUID changes.
+// The pindex source cache is also cleared here - index create/update/
+// delete mints new pindex names
 func (em *encryptionManager) bucketUpdateCallback() {
 	em.bucketStore.refreshBucketUUIDMap()
+	em.pindexSourceStore.reset()
 }
 
 // The callback is called in a separate go-routine (not protected by mutex)
@@ -1009,6 +1018,93 @@ func newBucketStore(mgr *cbgt.Manager) *bucketStore {
 	}
 }
 
+// ---------------------- pindex source store implementation -------------------
+
+// This store caches pindex name to source (bucket) name mappings for
+// non-scoped indexes, so the bleve writer hook does not have to consult
+// the cfg on every index file creation. The mapping is immutable for
+// the lifetime of a pindex.
+// Only successful resolutions are cached; a pindex that cannot be
+// resolved (e.g. its index was deleted while files are still being
+// flushed) falls through to a cfg lookup on every call.
+type pindexSourceStore struct {
+	mgr *cbgt.Manager
+
+	sourceLock    sync.RWMutex
+	sourceNameMap map[string]string
+}
+
+func newPIndexSourceStore(mgr *cbgt.Manager) *pindexSourceStore {
+	return &pindexSourceStore{
+		sourceNameMap: make(map[string]string),
+		mgr:           mgr,
+	}
+}
+
+// drops all cached mappings. Entries are immutable, so this is purely
+// to release entries stranded by index definition changes - each
+// create/update/delete mints new pindex names, leaving the old names
+// unreachable.
+func (ps *pindexSourceStore) reset() {
+	ps.sourceLock.Lock()
+	ps.sourceNameMap = make(map[string]string)
+	ps.sourceLock.Unlock()
+}
+
+// returns the source (bucket) name for the given pindex name, checking
+// the cache first and resolving via the manager on a miss
+func (ps *pindexSourceStore) getSourceNameForPIndex(pindexName string) (
+	string, error) {
+	// check cache first for the source name
+	ps.sourceLock.RLock()
+	sourceName := ps.sourceNameMap[pindexName]
+	ps.sourceLock.RUnlock()
+
+	// if not present, resolve via the manager and refresh the cache
+	if sourceName == "" {
+		var err error
+		sourceName, err = ps.resolveSourceName(pindexName)
+		if err != nil {
+			return "", err
+		}
+
+		ps.sourceLock.Lock()
+		ps.sourceNameMap[pindexName] = sourceName
+		ps.sourceLock.Unlock()
+	}
+	return sourceName, nil
+}
+
+// resolves the source (bucket) name for a pindex from the manager's
+// metadata, without consulting the cache
+func (ps *pindexSourceStore) resolveSourceName(pindexName string) (
+	string, error) {
+	// might be available in memory if the pindex is registered, so check that first
+	if pindex := ps.mgr.GetPIndex(pindexName); pindex != nil &&
+		pindex.SourceName != "" {
+		return pindex.SourceName, nil
+	}
+
+	// fallback for pindexes not yet registered. Note that this path hits
+	// the cfg, and failures are not cached - a pindex that cannot be
+	// resolved pays this cfg lookup on every call
+	indexName, err := ps.mgr.GetIndexNameForPIndex(pindexName)
+	if err != nil {
+		return "", err
+	}
+
+	indexDef, _, err := ps.mgr.GetIndexDef(indexName, false)
+	if err != nil {
+		// Force a full check in case the index def is not loaded yet
+		indexDef, _, err = ps.mgr.GetIndexDef(indexName, true)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	return indexDef.SourceName, nil
+}
+
 // clean disk path and obtain key type, bucket name and context for encryption
 func processPath(p string) (string, string, string, error) {
 	if p == "" {
@@ -1069,24 +1165,11 @@ func processPath(p string) (string, string, string, error) {
 		"or search history found in path: %s", p)
 }
 
-// for non-scoped indexes, the source name does not contain the bucket name,
-// so we need to obtain the source name from the index definition
+// for non-scoped indexes, the pindex name does not contain the bucket
+// name, so we need to obtain the source name from the index definition
 func nonScopedIndexSourceName(pindexName string) (string, error) {
-	// Extract the index name from the pindex name
-	indexName, err := encryptionManagerInstance.mgr.GetIndexNameForPIndex(pindexName)
-	if err != nil {
-		return "", err
-	}
-
-	indexDef, _, err := encryptionManagerInstance.mgr.GetIndexDef(indexName, false)
-	if err != nil {
-		// Force a full check incase the index def is not loaded yet
-		indexDef, _, err = encryptionManagerInstance.mgr.GetIndexDef(pindexName, true)
-		if err != nil {
-			return "", err
-		}
-	}
-	return indexDef.SourceName, nil
+	return encryptionManagerInstance.pindexSourceStore.
+		getSourceNameForPIndex(pindexName)
 }
 
 // check if the path component is the recovery plan directory
